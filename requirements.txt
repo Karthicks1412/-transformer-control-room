@@ -1,8 +1,7 @@
-services:
-  - type: web
-    name: transformer-control-room
-    env: python
-    plan: free
-    buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 120
-    healthCheckPath: /health
+Flask==3.0.3
+gunicorn==22.0.0
+paho-mqtt==1.6.1
+joblib>=1.4.2
+pandas>=2.2.2
+scikit-learn>=1.8.0
+numpy>=1.26.4

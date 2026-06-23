@@ -1,175 +1,77 @@
-"""
-app.py
-------
-Single Flask app combining:
-  1. MQTT listener (runs in a background thread)
-  2. ML prediction on every incoming reading
-  3. In-memory history (last 100 readings) + a /api/latest endpoint
-  4. The dashboard HTML page itself
+# Transformer Health Control Room — Cloud Deployment (Render)
 
-Deploy this on Render (or Railway) and you get ONE permanent URL.
-No laptop, no Colab, no local server needed once deployed.
-"""
+This gives you ONE permanent link, e.g.:
+`https://transformer-control-room.onrender.com`
 
-import os
-import json
-import threading
-import csv
-import io
-from datetime import datetime
-from collections import deque
+Anyone — the control room incharge, your review panel, anyone — just opens
+that link in any browser, on any device. No laptop running, no Colab, no
+cells, nothing. The dashboard auto-refreshes every 30 seconds on its own.
 
-import joblib
-import pandas as pd
-import paho.mqtt.client as mqtt
-from flask import Flask, jsonify, render_template, Response
+## What's in this folder
 
-app = Flask(__name__)
+```
+cloud_deploy/
+├── app.py                  <- the whole server: listener + model + dashboard
+├── templates/
+│   └── dashboard.html      <- the page people actually see
+├── models/                 <- your 4 trained .pkl files (already included)
+├── simulate_esp32.py       <- run on YOUR laptop to test, before hardware exists
+├── requirements.txt
+└── render.yaml             <- tells Render how to run this
+```
 
-# ---------- Config ----------
-MQTT_BROKER = "broker.hivemq.com"
-MQTT_PORT = 1883
-MQTT_TOPIC = "transformer/T1/dga"
-MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
-MAX_HISTORY = 100
+## One-time deployment steps (15–20 minutes, do this once)
 
-ALERT_MAP = {
-    "Normal": "SAFE",
-    "Partial_Discharge": "WARNING",
-    "Thermal_Fault": "CRITICAL",
-    "Arcing": "CRITICAL",
-}
-RISK_MAP = {
-    "Normal": "Low Risk",
-    "Partial_Discharge": "Moderate Risk",
-    "Thermal_Fault": "High Risk",
-    "Arcing": "Severe Risk",
-}
+### Step 1 — Put this code on GitHub
+1. Go to github.com, sign in (create a free account if you don't have one)
+2. Click **New repository** → name it e.g. `transformer-control-room` → set to **Public** → Create
+3. On the new repo page, click **uploading an existing file**
+4. Drag in ALL the files and folders from this `cloud_deploy` folder (app.py, templates/, models/, requirements.txt, render.yaml, simulate_esp32.py)
+5. Click **Commit changes**
 
-# ---------- Load model once at startup ----------
-model = joblib.load(os.path.join(MODEL_DIR, "best_model.pkl"))
-scaler = joblib.load(os.path.join(MODEL_DIR, "scaler.pkl"))
-le = joblib.load(os.path.join(MODEL_DIR, "label_encoder.pkl"))
-feature_cols = joblib.load(os.path.join(MODEL_DIR, "feature_cols.pkl"))
+### Step 2 — Deploy on Render
+1. Go to **render.com** → sign up free (you can sign up with your GitHub account directly — easiest option)
+2. Click **New +** → **Web Service**
+3. Connect your GitHub account if asked, then select your `transformer-control-room` repository
+4. Render will likely auto-detect the `render.yaml` file and pre-fill everything. If not, fill manually:
+   - **Name:** transformer-control-room
+   - **Environment:** Python 3
+   - **Build Command:** `pip install -r requirements.txt`
+   - **Start Command:** `gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 120`
+   - **Instance Type:** Free
+5. Click **Create Web Service**
+6. Wait 3–5 minutes while it builds (you'll see logs scrolling)
+7. When done, Render shows your live URL at the top, like:
+   `https://transformer-control-room.onrender.com`
 
-# ---------- In-memory history (thread-safe via lock) ----------
-history = deque(maxlen=MAX_HISTORY)
-history_lock = threading.Lock()
-last_reading_time = None
+That's it. That URL is permanent. Bookmark it, share it, put it in your PPT.
 
+## Testing it before hardware arrives
 
-def predict(raw):
-    h2 = raw.get("H2", 0.01) or 0.01
-    c2h6 = raw.get("C2H6", 0.01) or 0.01
-    c2h4 = raw.get("C2H4", 0.01) or 0.01
-    row = {
-        "H2": raw.get("H2", 0), "CH4": raw.get("CH4", 0),
-        "C2H6": raw.get("C2H6", 0), "C2H4": raw.get("C2H4", 0),
-        "C2H2": raw.get("C2H2", 0), "CO": raw.get("CO", 0), "CO2": raw.get("CO2", 0),
-        "Ratio_CH4_H2": raw.get("CH4", 0) / h2,
-        "Ratio_C2H4_C2H6": raw.get("C2H4", 0) / c2h6,
-        "Ratio_C2H2_C2H4": raw.get("C2H2", 0) / c2h4,
-    }
-    df_in = pd.DataFrame([row])[feature_cols]
-    scaled = scaler.transform(df_in)
-    idx = model.predict(scaled)[0]
-    prob = model.predict_proba(scaled)[0].max()
-    return le.classes_[idx], float(prob)
+On YOUR laptop (just for testing, not needed after hardware is connected):
 
+1. Open Command Prompt in this folder
+2. Run: `pip install paho-mqtt`
+3. Run: `python simulate_esp32.py`
+4. Open your Render URL in a browser — within ~30-40 seconds it should show LIVE data, cycling through Normal / Partial Discharge / Thermal Fault / Arcing
+5. Press Ctrl+C in Command Prompt to stop the simulator whenever you want
 
-def on_connect(client, userdata, flags, rc):
-    if rc == 0:
-        print("[mqtt] Connected to broker.")
-        client.subscribe(MQTT_TOPIC)
-    else:
-        print(f"[mqtt] Connection failed, code {rc}")
+## When real ESP32 hardware is ready
 
+Nothing changes on the server. Just:
+1. Make sure the ESP32 firmware has the correct WiFi credentials and publishes to the same MQTT broker/topic (`broker.hivemq.com`, topic `transformer/T1/dga`) — same as what's already in your `.ino` firmware
+2. Power on the ESP32
+3. Stop running `simulate_esp32.py` if it's still running
+4. Open the same Render URL — now it shows real sensor data instead of simulated
 
-def on_message(client, userdata, msg):
-    global last_reading_time
-    try:
-        raw = json.loads(msg.payload.decode())
-        fault, conf = predict(raw)
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+## Important free-tier note
 
-        # Avoid duplicate readings landing within the same second
-        if last_reading_time == ts:
-            return
-        last_reading_time = ts
+Render's free tier "sleeps" the service after about 15 minutes of no traffic, and takes ~30-50 seconds to wake up on the next visit. For your review/demo day, simply open the link 1-2 minutes before the panel arrives so it's already awake. This doesn't affect data — the MQTT listener still runs and stores recent history once awake; only the very first visit after a long idle period feels slow.
 
-        record = {
-            "Timestamp": ts,
-            "H2": raw.get("H2", 0), "CH4": raw.get("CH4", 0),
-            "C2H6": raw.get("C2H6", 0), "C2H4": raw.get("C2H4", 0),
-            "C2H2": raw.get("C2H2", 0), "CO": raw.get("CO", 0),
-            "CO2": raw.get("CO2", 0),
-            "Fault_Type": fault,
-            "Confidence": round(conf, 4),
-            "Alert": ALERT_MAP.get(fault, "UNKNOWN"),
-            "Risk_Level": RISK_MAP.get(fault, "Unknown"),
-        }
-        with history_lock:
-            history.append(record)
-        print(f"[mqtt] {ts} | {fault} | {ALERT_MAP.get(fault)} | conf={conf:.2f}")
-    except Exception as e:
-        print(f"[mqtt] Error processing message: {e}")
+If you want zero sleep delay even for casual checking, the paid Render tier removes this — not necessary for a college project, just worth knowing as a real fact.
 
+## Troubleshooting
 
-def start_mqtt_thread():
-    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1, client_id="render-transformer-listener")
-    client.on_connect = on_connect
-    client.on_message = on_message
-    client.connect(MQTT_BROKER, MQTT_PORT, 60)
-    client.loop_forever()
-
-
-# Start MQTT listener in a background thread when the app boots
-mqtt_thread = threading.Thread(target=start_mqtt_thread, daemon=True)
-mqtt_thread.start()
-
-
-# ---------- Routes ----------
-
-@app.route("/")
-def dashboard():
-    return render_template("dashboard.html")
-
-
-@app.route("/api/latest")
-def api_latest():
-    with history_lock:
-        rows = list(history)
-    if not rows:
-        return jsonify({"status": "waiting", "latest": None, "history": []})
-    return jsonify({
-        "status": "live",
-        "latest": rows[-1],
-        "history": rows[-15:],
-        "total_readings": len(rows),
-    })
-
-
-@app.route("/api/download_csv")
-def download_csv():
-    with history_lock:
-        rows = list(history)
-    output = io.StringIO()
-    if rows:
-        writer = csv.DictWriter(output, fieldnames=list(rows[0].keys()))
-        writer.writeheader()
-        writer.writerows(rows)
-    return Response(
-        output.getvalue(),
-        mimetype="text/csv",
-        headers={"Content-Disposition": "attachment;filename=transformer_log.csv"},
-    )
-
-
-@app.route("/health")
-def health():
-    return jsonify({"status": "ok"})
-
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+- **Render shows "Application failed to respond"**: check the Render logs tab — usually means a missing file in `models/` or a typo in requirements.txt
+- **Dashboard says "NO DATA" forever**: the MQTT listener inside `app.py` couldn't connect, or nothing is publishing yet. Run `simulate_esp32.py` from your laptop to test.
+- **"Module not found" during build**: a package name/version issue in `requirements.txt` — paste the exact Render build log error and it can be fixed precisely.
